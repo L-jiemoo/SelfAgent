@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "default_provider": "deepseek",
+  "default_model": "deepseek-v4-flash",
+  "providers": {
+    "deepseek": {
+      "kind": "openai",
+      "base_url": "https://api.deepseek.com",
+      "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+      "tools": true
+    },
+    "openai": {
+      "kind": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "models": [],
+      "tools": true
+    },
+    "anthropic": {
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "models": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+      "tools": true
+    },
+    "qwen": {
+      "kind": "openai",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "models": ["qwen-max", "qwen-plus"],
+      "tools": true
+    },
+    "kimi": {
+      "kind": "openai",
+      "base_url": "https://api.moonshot.cn/v1",
+      "models": ["kimi-k2-0905-preview"],
+      "tools": false
+    },
+    "zhipu": {
+      "kind": "openai",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "models": ["glm-4-plus"],
+      "tools": false
+    },
+    "doubao": {
+      "kind": "openai",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "models": [],
+      "tools": true
+    },
+    "custom": {
+      "kind": "openai",
+      "base_url": "http://localhost:11434/v1",
+      "models": [],
+      "tools": true
+    }
+  },
+  "aliases": {
+    "claude": { "provider": "anthropic", "model": "claude-opus-4-7" },
+    "flash": { "provider": "deepseek", "model": "deepseek-v4-flash" },
+    "pro": { "provider": "deepseek", "model": "deepseek-v4-pro" }
+  },
+  "generation": {
+    "max_tokens": 8192,
+    "temperature": null,
+    "system": "You are a helpful assistant."
+  },
+  "ui": {
+    "stream": true,
+    "color": true,
+    "show_thinking": false,
+    "splash_animation": true,
+    "spinner": true
+  },
+  "history": {
+    "enabled": true,
+    "dir": "history",
+    "max_turns": 50
+  },
+  "skills": {
+    "enabled": true,
+    "dir": "skills"
+  },
+  "tools": {
+    "enabled": true,
+    "workspace": null,
+    "confirm_writes": true,
+    "max_steps": 10,
+    "max_read_bytes": 262144
+  }
+}

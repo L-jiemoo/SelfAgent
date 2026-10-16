@@ -1,0 +1,10 @@
+andist/
+build/
+.venv/
+__pycache__/
+*.pyc
+*.spec
+.pytest_cache/
+.workbuddy-ai/
+secrets.enc
+history/

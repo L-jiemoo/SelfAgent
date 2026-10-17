@@ -18,9 +18,11 @@ accumulation that the OpenAI side needs applies.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterator
 
 from ..errors import ProviderError, ToolsUnsupportedError
+from .retry import delay_for, is_transient
 from .base import (
     Done,
     Message,
@@ -157,39 +159,58 @@ class AnthropicProvider(Provider):
             # tool_choice left unset: "auto" is the default and the forced
             # variants are rejected on some models.
 
-        try:
-            with client.messages.stream(**kwargs) as stream:
-                for event in stream:
-                    if getattr(event, "type", None) != "content_block_delta":
-                        continue
-                    delta = getattr(event, "delta", None)
-                    delta_type = getattr(delta, "type", None)
-                    if delta_type == "text_delta":
-                        if delta.text:
-                            yield TextDelta(delta.text)
-                    elif delta_type == "thinking_delta" and self.show_thinking:
-                        if delta.thinking:
-                            yield ThinkingDelta(delta.thinking)
-
-                # Must run inside the context manager -- it accumulates the
-                # blocks that arrived over the stream, and the object is unusable
-                # once the stream is closed. Its tool_use inputs are already
-                # parsed, which is why no input_json_delta handling appears here.
-                final = stream.get_final_message()
-        except Exception as exc:
+        # Retried here rather than around a single call, because opening the
+        # stream and reading it are one `with` block. The guard is `emitted`:
+        # once a delta has gone to the caller the request cannot be replayed
+        # without printing the same text twice.
+        total = max(1, self.retries)
+        final: Any = None
+        for attempt in range(1, total + 1):
+            emitted = False
             try:
-                import anthropic
-            except ImportError:  # pragma: no cover
-                raise
-            if (
-                isinstance(exc, anthropic.BadRequestError)
-                and self.tools
-                and _looks_like_tools_error(exc)
-            ):
-                raise ToolsUnsupportedError(
-                    f"[{self.spec.name}] 该端点不支持工具调用:{_detail(exc)}"
-                ) from None
-            raise _friendly(exc, self.spec.name, self.spec.base_url) from None
+                with client.messages.stream(**kwargs) as stream:
+                    for event in stream:
+                        if getattr(event, "type", None) != "content_block_delta":
+                            continue
+                        delta = getattr(event, "delta", None)
+                        delta_type = getattr(delta, "type", None)
+                        if delta_type == "text_delta":
+                            if delta.text:
+                                emitted = True
+                                yield TextDelta(delta.text)
+                        elif delta_type == "thinking_delta" and self.show_thinking:
+                            if delta.thinking:
+                                emitted = True
+                                yield ThinkingDelta(delta.thinking)
+
+                    # Must run inside the context manager -- it accumulates the
+                    # blocks that arrived over the stream, and the object is
+                    # unusable once the stream is closed. Its tool_use inputs are
+                    # already parsed, which is why no input_json_delta handling
+                    # appears here.
+                    final = stream.get_final_message()
+            except Exception as exc:
+                if not emitted and attempt < total and is_transient(exc):
+                    delay = delay_for(attempt)
+                    if self.on_retry is not None:
+                        self.on_retry(attempt, total, delay, exc)
+                    time.sleep(delay)
+                    continue
+
+                try:
+                    import anthropic
+                except ImportError:  # pragma: no cover
+                    raise
+                if (
+                    isinstance(exc, anthropic.BadRequestError)
+                    and self.tools
+                    and _looks_like_tools_error(exc)
+                ):
+                    raise ToolsUnsupportedError(
+                        f"[{self.spec.name}] 该端点不支持工具调用:{_detail(exc)}"
+                    ) from None
+                raise _friendly(exc, self.spec.name, self.spec.base_url) from None
+            break
 
         calls = _extract_tool_calls(final)
         if calls:

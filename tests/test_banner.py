@@ -83,6 +83,35 @@ def test_shows_version_and_what_the_tool_is() -> None:
     assert banner.TAGLINE in body
 
 
+def test_a_configured_agent_name_replaces_the_product_name() -> None:
+    info = banner.info_lines(
+        "1.0.0", "deepseek/deepseek-v4-flash", r"D:\x", PROVIDERS, set(), name="小助手"
+    )
+    body = "\n".join(text_of(info))
+    assert "小助手 v1.0.0" in body
+    assert "SelfAgent" not in body
+
+
+def test_splash_uses_the_configured_theme() -> None:
+    renderer = Renderer(color=True, out=Tty(), err=io.StringIO())
+    renderer.set_theme((255, 0, 0), (0, 0, 255), (255, 0, 0))
+    renderer.splash(banner.LOGO, [("标题", "bold")])
+
+    out = renderer.out.getvalue()
+    assert "38;2;255;0;0" in out
+    assert "38;2;0;0;255" in out
+
+
+def test_the_degraded_logo_uses_the_agent_name() -> None:
+    renderer = Renderer(color=True, out=GbkTty(), err=io.StringIO())
+    renderer.set_agent_name("小助手")
+    renderer.splash(banner.LOGO, [("标题", "bold")])
+
+    out = renderer.out.getvalue()
+    assert "小助手" in out
+    assert "▀" not in out
+
+
 def test_lists_every_provider_with_its_models() -> None:
     body = "\n".join(text_of(lines()))
     for name, spec in PROVIDERS.items():

@@ -161,6 +161,17 @@ def test_glint_peaks_under_its_phase() -> None:
     assert render._sweep_row("ab", base, 0.0, 2).startswith(render._fg(render.HIGHLIGHT))
 
 
+def test_the_glint_is_derived_from_the_theme() -> None:
+    renderer = Renderer(color=True, out=Tty(), err=io.StringIO())
+    renderer.set_theme((255, 0, 0), (255, 0, 0), (255, 0, 0))
+    assert renderer._highlight != render.HIGHLIGHT
+
+
+def test_sweep_row_accepts_a_themed_glint() -> None:
+    row = render._sweep_row("ab", (10, 20, 30), 0.0, 2, (255, 255, 255))
+    assert render._fg((255, 255, 255)) in row
+
+
 def test_glint_wraps_around_the_loop() -> None:
     # A glint at phase 0.98 is still lighting the left edge, because distance is
     # measured around the infinity rather than along the row.

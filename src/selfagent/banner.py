@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from typing import Mapping
 
-# Cyan -> violet, applied top to bottom across the six logo rows.
-COLOR_TOP = (0x22, 0xD3, 0xEE)
-COLOR_BOTTOM = (0xA8, 0x55, 0xF7)
+from .render import GRADIENT_BOTTOM, GRADIENT_TOP
+
+# Cyan -> violet by default; config.json's ui.theme overrides both ends.
+COLOR_TOP = GRADIENT_TOP
+COLOR_BOTTOM = GRADIENT_BOTTOM
 
 LOGO: tuple[str, ...] = (
     "  ▄▄███▀▀▀▀███▄▄            ▄▄███▀▀▀▀███▄▄  ",
@@ -27,7 +29,7 @@ LOGO: tuple[str, ...] = (
     "  ▀▀███▄▄▄▄███▀▀            ▀▀███▄▄▄▄███▀▀  ",
 )
 
-TITLE = "SelfAgent v{} · 便携式多模型 CLI Agent"
+TITLE = "{name} v{version} · 便携式多模型 CLI Agent"
 TAGLINE = "U盘即插即用,目标电脑无需安装 Python 或配置环境变量"
 MODELS_HEADER = "已挂载模型      * = 已配置 Key,可直接使用"
 NO_MODELS = "(未列模型,可任意指定)"
@@ -50,12 +52,16 @@ def info_lines(
     directory_label: str = "运行目录",
     tools_note: str | None = None,
     skills: list[str] | None = None,
+    name: str = "SelfAgent",
 ) -> list[InfoLine]:
     """`providers` maps name -> anything with a `.models` list. `mounted` is the
     set of provider names that actually have an API key, which is the honest
-    meaning of "mounted": configured but keyless cannot be called."""
+    meaning of "mounted": configured but keyless cannot be called.
+
+    `name` is the user's display name for the agent (config.json agent.name).
+    """
     lines: list[InfoLine] = [
-        (TITLE.format(version), "bold"),
+        (TITLE.format(name=name, version=version), "bold"),
         (TAGLINE, "dim"),
         ("", ""),
         (MODELS_HEADER, "bold"),

@@ -9,11 +9,12 @@ expects without a mode flag.
 from __future__ import annotations
 
 import argparse
+import json
 import locale
 import sys
 from pathlib import Path
 
-from . import __version__, paths, registry, secrets, skills as skills_mod
+from . import __version__, context, paths, registry, secrets, skills as skills_mod
 from .config import Config, load_config
 from .engine import Engine
 from .errors import SelfAgentError
@@ -23,7 +24,25 @@ from .skills import Skill
 from .tools import Toolbox, auto_root
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _display_name() -> str:
+    """Best-effort display name for --version.
+
+    Read straight from config.json rather than through load_config(): --version
+    must work on a machine with a broken config, and it must not materialise a
+    default config.json as a side effect of printing a version string.
+    """
+    try:
+        raw = json.loads(paths.config_path().read_text(encoding="utf-8"))
+        agent = raw.get("agent") if isinstance(raw, dict) else None
+        name = agent.get("name") if isinstance(agent, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except (OSError, ValueError):
+        pass
+    return "SelfAgent"
+
+
+def build_parser(name: str = "SelfAgent") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent",
         description="便携式多模型命令行助手。无参数进入交互模式,带问题则单次回答。",
@@ -52,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="本次不加载 skills 目录里的技能",
     )
-    parser.add_argument("--version", action="version", version=f"SelfAgent {__version__}")
+    parser.add_argument("--version", action="version", version=f"{name} {__version__}")
     return parser
 
 
@@ -228,6 +247,7 @@ def _build_toolbox(
         allow_write=allow_write,
         max_read_bytes=config.tools.max_read_bytes,
         read_roots=read_roots,
+        protect=config.tools.protect,
     )
 
 
@@ -281,7 +301,7 @@ def _read_stdin_if_piped() -> str | None:
 def main(argv: list[str] | None = None) -> int:
     _configure_output_encoding()
 
-    args = build_parser().parse_args(argv)
+    args = build_parser(_display_name()).parse_args(argv)
 
     renderer = Renderer(
         color=not args.no_color,
@@ -294,11 +314,22 @@ def main(argv: list[str] | None = None) -> int:
         renderer.error(str(exc))
         return 1
 
+    renderer.set_theme(
+        config.ui.theme_top, config.ui.theme_bottom, config.ui.theme_accent
+    )
+    renderer.set_agent_name(config.agent.name)
+    # Identity goes in before skills and project conventions, so the prompt
+    # reads: base instruction -> who you are -> capabilities -> this project.
+    identity = config.agent.system_block()
+    if identity:
+        config.generation.system = (config.generation.system or "") + identity
+
     # The Renderer is built before the config is read -- it is what reports a
     # broken config -- so the animation switch is applied here rather than in
     # the constructor.
     renderer.animate = renderer.animate and config.ui.splash_animation
     renderer.show_spinner = renderer.show_spinner and config.ui.spinner
+    renderer.show_box = renderer.show_box and config.ui.prompt_box
 
     if args.show_thinking:
         config.ui.show_thinking = True
@@ -318,6 +349,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     skills_root, installed = _discover_skills(config, args)
+
+    # The project's own conventions, read from wherever the tools work. Done
+    # regardless of whether tools are on: knowing the conventions is useful even
+    # when the model is only talking.
+    workspace = auto_root(args.dir or config.tools.workspace)
+    context_block, context_path = ("", None)
+    if config.context.enabled:
+        context_block, context_path = context.load(
+            workspace, config.context.file, config.context.max_chars
+        )
+    if context_block:
+        config.generation.system = (config.generation.system or "") + context_block
 
     toolbox = _build_toolbox(
         config,
@@ -340,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
             persist=not args.no_history,
             toolbox=toolbox,
             skills=installed,
+            context_path=context_path,
         )
     except SelfAgentError as exc:
         renderer.error(str(exc))

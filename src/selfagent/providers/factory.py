@@ -21,6 +21,7 @@ def build_provider(
     config: Config,
     *,
     tools: list[ToolSpec] | None = None,
+    on_retry=None,
 ) -> Provider:
     adapter = _ADAPTERS.get(target.provider.kind)
     if adapter is None:
@@ -37,6 +38,8 @@ def build_provider(
         temperature=config.generation.temperature,
         show_thinking=config.ui.show_thinking,
         tools=tools,
+        retries=config.generation.retries,
+        on_retry=on_retry,
     )
 
 

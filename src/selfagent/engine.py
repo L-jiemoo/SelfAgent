@@ -30,6 +30,7 @@ from .registry import Target, resolve
 from .render import Renderer
 from .secrets import SecretStore
 from .session import Session
+from .tools import WriteRecord
 
 # A transcript longer than this is truncated from the front before being sent to
 # the summariser: the tail is what matters and the head is what the model is
@@ -55,6 +56,7 @@ class Engine:
         persist: bool = True,
         toolbox=None,
         skills=None,
+        context_path=None,
     ) -> None:
         self.config = config
         self.secrets = secrets
@@ -63,6 +65,9 @@ class Engine:
         # Held only so the REPL can list them; the model learns about skills
         # through the system prompt, not through this attribute.
         self.skills = list(skills or [])
+        # Same: shown by /status so "why is it ignoring my conventions" has an
+        # answer that is not guesswork.
+        self.context_path = context_path
         self.target: Target = resolve(config, model_token)
         self.session = Session(
             config,
@@ -73,6 +78,9 @@ class Engine:
         # Flipped off for the rest of the session once an endpoint proves it
         # cannot take the tools parameter.
         self.tools_enabled = bool(config.tools.enabled and toolbox is not None)
+        # Kept so /retry can send the same question again without the user
+        # retyping it -- the whole reason to have the command.
+        self.last_question: str | None = None
 
     def switch(self, token: str | None) -> Target:
         """Change model. Existing history is kept -- switching mid-conversation
@@ -85,21 +93,47 @@ class Engine:
         self.tools_enabled = bool(self.config.tools.enabled and self.toolbox is not None)
         return self.target
 
-    def set_tools(self, enabled: bool) -> None:
-        """Turn the file tools on or off for this session.
+    def set_tools_mode(self, mode: str) -> str:
+        """Switch the file tools between off, read-only and read-write.
 
-        Only ever narrows or restores what was configured at launch: with no
-        toolbox there is nothing to switch on, and saying so beats silently
-        doing nothing.
+        Read-only is the interesting one: it is the mode you want on a machine
+        that is not yours when you still want the model to be able to look
+        around. Only ever narrows or restores what was configured at launch --
+        with no toolbox there is nothing to switch on.
         """
+        if mode == "off":
+            self.tools_enabled = False
+            return "文件工具已关闭。"
         if self.toolbox is None:
             raise SelfAgentError(
                 "本次启动没有文件工具(可能用了 --no-tools,或工作目录不存在),无法打开。"
             )
-        self.tools_enabled = bool(enabled) and self.config.tools.enabled
+        self.tools_enabled = self.config.tools.enabled
+        self.toolbox.allow_write = mode == "on"
+        if mode == "on":
+            return "文件工具:可读可写,每次写入前确认。"
+        return "文件工具:只读(模型能看,但改不了)。"
+
+    # ---- taking it back -------------------------------------------------
+
+    def undo(self) -> str | None:
+        """Roll back the most recent file write. None when there is none left.
+
+        The record holds the file's previous contents, captured by the toolbox
+        at write time -- the confirmation callback already had them, and they
+        were being thrown away.
+        """
+        if self.toolbox is None:
+            raise SelfAgentError("本次启动没有文件工具,没有可撤销的修改。")
+        return self.toolbox.undo_last()
+
+    def audit(self) -> list[WriteRecord]:
+        """Every file this session has written, newest first."""
+        if self.toolbox is None:
+            return []
+        return list(reversed(self.toolbox.writes))
 
     # ---- compaction ---------------------------------------------------
-
     def compact(self) -> str:
         """Replace the conversation with a summary of itself.
 
@@ -169,6 +203,7 @@ class Engine:
         # Resolve credentials before touching history, so a missing key leaves
         # the conversation exactly as it was.
         key = require_key(self.secrets, self.target)
+        self.last_question = text
         self.session.add_user(text)
 
         last_text = ""
@@ -228,7 +263,9 @@ class Engine:
         try with tools and fall back once, then remember for the session.
         """
         tools = self._tool_specs()
-        provider = build_provider(self.target, key, self.config, tools=tools)
+        provider = build_provider(
+            self.target, key, self.config, tools=tools, on_retry=self._notify_retry
+        )
         try:
             yield from provider.stream(self.session.context())
         except ToolsUnsupportedError as exc:
@@ -236,8 +273,29 @@ class Engine:
                 raise
             self.tools_enabled = False
             self.renderer.warning(f"{exc} 本次会话改用纯文本模式。")
-            fallback = build_provider(self.target, key, self.config, tools=[])
+            fallback = build_provider(
+                self.target, key, self.config, tools=[], on_retry=self._notify_retry
+            )
             yield from fallback.stream(self.session.context())
+
+    def _notify_retry(self, attempt: int, total: int, delay: float, exc: Exception) -> None:
+        """Say so before sleeping: a silent pause reads as a hang."""
+        self.renderer.warning(
+            f"请求失败({exc.__class__.__name__}),{delay:.0f} 秒后重试"
+            f"({attempt + 1}/{total})。"
+        )
+        # warning() stops the spinner; put it back, since the wait is not over.
+        self.renderer.thinking_start()
+
+    def retry(self) -> str:
+        """Send the most recent question again.
+
+        Useful when a request died part-way: the failed turn is repaired out of
+        the history first, so this does not leave a dangling question behind.
+        """
+        if not self.last_question:
+            raise SelfAgentError("还没有问过任何问题,没有可重发的。")
+        return self.ask(self.last_question)
 
     def _run_tools(self, calls: list[ToolCall]) -> list[ToolResult]:
         results: list[ToolResult] = []

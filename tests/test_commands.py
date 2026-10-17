@@ -8,15 +8,16 @@ most of these tests are about what survives a failure.
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 
 import pytest
 
 from selfagent import doctor, render, repl
-from selfagent.config import load_config
+from selfagent.config import DEFAULT_CONFIG, load_config
 from selfagent.engine import MAX_TRANSCRIPT, Engine
-from selfagent.errors import ProviderError, SelfAgentError
-from selfagent.providers.base import Done, TextDelta, Usage
+from selfagent.errors import ConfigError, ProviderError, SelfAgentError
+from selfagent.providers.base import Done, TextDelta, ToolCall, Usage
 from selfagent.render import Renderer
 from selfagent.secrets import SecretStore
 from selfagent.session import COMPACT_MARKER
@@ -155,18 +156,24 @@ def test_a_huge_transcript_is_truncated_from_the_front(app_dir: Path) -> None:
 def test_set_tools_without_a_toolbox_explains_itself(app_dir: Path) -> None:
     engine = make_engine(app_dir)
     with pytest.raises(SelfAgentError, match="没有文件工具"):
-        engine.set_tools(True)
+        engine.set_tools_mode("on")
 
 
-def test_set_tools_toggles_the_session(app_dir: Path, tmp_path: Path) -> None:
+def test_tool_modes_cycle_through_off_readonly_and_on(app_dir: Path, tmp_path: Path) -> None:
     engine = make_engine(app_dir, toolbox=make_toolbox(tmp_path))
     assert engine.tools_enabled is True
+    assert engine.toolbox.allow_write is True
 
-    engine.set_tools(False)
+    engine.set_tools_mode("readonly")
+    assert engine.tools_enabled is True, "the model can still look around"
+    assert engine.toolbox.allow_write is False, "but it cannot write"
+
+    engine.set_tools_mode("off")
     assert engine.tools_enabled is False
 
-    engine.set_tools(True)
+    engine.set_tools_mode("on")
     assert engine.tools_enabled is True
+    assert engine.toolbox.allow_write is True
 
 
 # ---- /doctor ---------------------------------------------------------
@@ -318,8 +325,203 @@ def test_unknown_command_is_reported(app_dir: Path, console: Renderer) -> None:
 
 
 def test_help_lists_every_command(app_dir: Path, console: Renderer) -> None:
-    for name in ("/status", "/doctor", "/compact", "/tools", "/dir", "/cost", "/resume", "/forget"):
+    for name in (
+        "/status", "/doctor", "/compact", "/tools", "/dir", "/cost",
+        "/resume", "/forget", "/undo", "/audit", "/export", "/retry",
+        "/theme", "/name", "/persona", "/instructions", "/default-model",
+    ):
         assert name in repl.HELP
+
+
+# ---- customisation commands write config.json ------------------------
+
+
+def read_saved(app_dir: Path) -> dict:
+    return json.loads((app_dir / "config.json").read_text(encoding="utf-8"))
+
+
+def test_theme_command_saves_and_applies(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/theme #ff0000 #00ff00 #0000ff")
+
+    saved = read_saved(app_dir)
+    assert saved["ui"]["theme"] == {
+        "top": "#ff0000",
+        "bottom": "#00ff00",
+        "accent": "#0000ff",
+    }
+    assert engine.config.ui.theme_top == (255, 0, 0)
+    assert console.gradient_top == (255, 0, 0)
+    assert console.gradient_bottom == (0, 255, 0)
+    assert console.accent == (0, 0, 255)
+
+
+def test_theme_accent_follows_the_top_when_omitted(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/theme f00 00f")
+
+    assert read_saved(app_dir)["ui"]["theme"] == {
+        "top": "#ff0000",
+        "bottom": "#0000ff",
+        "accent": "#ff0000",
+    }
+    assert console.accent == (255, 0, 0)
+
+
+def test_theme_rejects_a_bad_colour_without_writing(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+    before = (app_dir / "config.json").read_text(encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="theme.top"):
+        repl._handle_command(engine, console, "/theme nope #00ff00")
+
+    assert (app_dir / "config.json").read_text(encoding="utf-8") == before
+
+
+def test_name_command_saves_and_renames(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/name 小助手")
+
+    assert read_saved(app_dir)["agent"]["name"] == "小助手"
+    assert engine.config.agent.name == "小助手"
+    assert console.agent_name == "小助手"
+
+
+def test_persona_and_instructions_are_saved_for_the_next_launch(
+    app_dir: Path, console: Renderer
+) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/persona 严谨的代码审阅助手")
+    repl._handle_command(engine, console, "/instructions 回答先给结论")
+
+    saved = read_saved(app_dir)
+    assert saved["agent"]["persona"] == "严谨的代码审阅助手"
+    assert saved["agent"]["instructions"] == "回答先给结论"
+    assert "下次启动" in console.out.getvalue()
+
+
+def test_persona_dash_clears_it(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/persona 严谨的代码审阅助手")
+    repl._handle_command(engine, console, "/persona -")
+
+    assert read_saved(app_dir)["agent"]["persona"] == ""
+    assert engine.config.agent.persona == ""
+
+
+def test_default_model_is_saved_and_switched(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+
+    repl._handle_command(engine, console, "/default-model deepseek/deepseek-v4-pro")
+
+    saved = read_saved(app_dir)
+    assert saved["default_provider"] == "deepseek"
+    assert saved["default_model"] == "deepseek-v4-pro"
+    assert engine.target.model == "deepseek-v4-pro"
+
+
+# ---- /undo and /audit ------------------------------------------------
+
+
+def test_undo_without_a_toolbox_says_so(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+    repl._handle_command(engine, console, "/undo")
+    assert "没有文件工具" in console.err.getvalue()
+
+
+def test_undo_reports_when_there_is_nothing_to_take_back(
+    app_dir: Path, tmp_path: Path, console: Renderer
+) -> None:
+    engine = make_engine(app_dir, toolbox=make_toolbox(tmp_path))
+    repl._handle_command(engine, console, "/undo")
+    assert "没有可撤销" in console.out.getvalue()
+
+
+def test_audit_reports_an_untouched_session(
+    app_dir: Path, tmp_path: Path, console: Renderer
+) -> None:
+    engine = make_engine(app_dir, toolbox=make_toolbox(tmp_path))
+    repl._handle_command(engine, console, "/audit")
+    assert "还没有修改过" in console.out.getvalue()
+
+
+def test_audit_lists_what_was_written(app_dir: Path, tmp_path: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir, toolbox=make_toolbox(tmp_path))
+    engine.toolbox.execute(
+        ToolCall("c1", "write_file", {"path": "note.txt", "content": "hi"})
+    )
+
+    repl._handle_command(engine, console, "/audit")
+
+    text = console.out.getvalue()
+    assert "修改过 1 个文件" in text
+    assert "note.txt" in text
+
+
+def test_undo_takes_the_write_back(app_dir: Path, tmp_path: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir, toolbox=make_toolbox(tmp_path))
+    engine.toolbox.execute(
+        ToolCall("c1", "write_file", {"path": "note.txt", "content": "hi"})
+    )
+
+    repl._handle_command(engine, console, "/undo")
+
+    assert not (tmp_path / "note.txt").exists()
+    assert "删除" in console.out.getvalue()
+
+
+# ---- /export ---------------------------------------------------------
+
+
+def test_export_writes_a_markdown_file(app_dir: Path, tmp_path: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+    engine.session.add_user("问题")
+    engine.session.add_assistant("回答")
+    target = tmp_path / "out.md"
+
+    repl._handle_command(engine, console, f"/export {target}")
+
+    assert target.exists()
+    body = target.read_text(encoding="utf-8")
+    assert "问题" in body and "回答" in body
+    assert "已导出" in console.out.getvalue()
+
+
+def test_export_title_uses_the_configured_agent_name(
+    app_dir: Path, tmp_path: Path, console: Renderer
+) -> None:
+    data = json.loads(json.dumps(DEFAULT_CONFIG))
+    data["agent"]["name"] = "小助手"
+    (app_dir / "config.json").write_text(json.dumps(data), encoding="utf-8")
+
+    engine = make_engine(app_dir)
+    engine.session.add_user("问题")
+    engine.session.add_assistant("回答")
+    target = tmp_path / "out.md"
+
+    repl._handle_command(engine, console, f"/export {target}")
+
+    assert target.read_text(encoding="utf-8").startswith("# 小助手 对话导出")
+
+
+def test_export_with_nothing_to_say(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+    repl._handle_command(engine, console, "/export")
+    assert "没有对话内容" in console.err.getvalue()
+
+
+# ---- /retry ----------------------------------------------------------
+
+
+def test_retry_without_a_question_is_refused(app_dir: Path, console: Renderer) -> None:
+    engine = make_engine(app_dir)
+    with pytest.raises(SelfAgentError, match="没有可重发"):
+        repl._handle_command(engine, console, "/retry")
 
 
 # ---- /resume ---------------------------------------------------------

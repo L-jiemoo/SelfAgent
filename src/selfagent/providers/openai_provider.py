@@ -21,6 +21,7 @@ import json
 from typing import Any, Iterator
 
 from ..errors import ProviderError, ToolsUnsupportedError
+from .retry import open_with_retries
 from .base import (
     Done,
     Message,
@@ -222,7 +223,11 @@ class OpenAICompatProvider(Provider):
             # DeepSeek and Qwen reject "required"/forced choices outright when
             # thinking is on.
 
-        chunk_iter = self._open_stream(client, kwargs)
+        # Only the opening is retried: the loop below may already have handed
+        # text to the caller, and replaying it would print it twice.
+        chunk_iter = open_with_retries(
+            lambda: self._open_stream(client, kwargs), self.retries, self.on_retry
+        )
 
         saw_usage = False
         stop_reason: str | None = None

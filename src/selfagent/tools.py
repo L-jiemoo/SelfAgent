@@ -18,7 +18,7 @@ concerns out of it.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,13 +29,59 @@ MAX_READ_BYTES = 256 * 1024
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_MATCHES = 200
 DEFAULT_READ_LINES = 2000
+# How many writes can be taken back. Bounded because each record holds the
+# file's previous contents in memory.
+MAX_UNDO = 20
 
 # Files that are almost never what anyone means, and that would waste the
 # model's context on noise.
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", ".idea", ".mypy_cache"}
 
+# Not a security boundary -- the sandbox is. But "the agent tidied my code" and
+# "the agent rotated my credentials" are different kinds of event, and the second
+# one is worth a hard stop even inside an authorised workspace.
+PROTECTED_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.enc",
+}
+PROTECTED_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".keystore", ".jks")
+PROTECTED_DIRS = {".git", ".ssh", ".aws", ".gnupg"}
+
 # (action label, path, old text, new text) -> approved
 ConfirmFn = Callable[[str, Path, str, str], bool]
+
+
+def _protected_reason(path: Path) -> str:
+    name = path.name.lower()
+    if name in PROTECTED_NAMES:
+        return "凭据类文件"
+    if name.endswith(PROTECTED_SUFFIXES):
+        return "密钥或证书"
+    for part in path.parts:
+        if part.lower() in PROTECTED_DIRS:
+            return f"{part}/ 是版本控制或密钥目录"
+    return ""
+
+
+@dataclass
+class WriteRecord:
+    """What a write replaced, so it can be put back."""
+
+    path: Path
+    action: str
+    existed: bool
+    previous: str
+    written: str
 
 
 @dataclass
@@ -50,6 +96,10 @@ class Toolbox:
     # exemption read-only is what stops a skill -- or a prompt injected into one
     # -- from becoming a write primitive.
     read_roots: tuple[Path, ...] = ()
+    # Refuse to rewrite credential-shaped paths even inside the workspace.
+    protect: bool = True
+    # Writes made this session, newest last, so they can be reviewed and undone.
+    writes: list[WriteRecord] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
@@ -83,6 +133,10 @@ class Toolbox:
             )
         allowed = ", ".join(str(extra) for extra in (self.root, *self.read_roots))
         raise ToolError(f"路径越界,拒绝访问:{raw}。只允许访问:{allowed}。")
+
+    def label(self, path: Path) -> str:
+        """Public name for a path, for callers that only need to print it."""
+        return self._relative(Path(path))
 
     def _relative(self, path: Path) -> str:
         """A readable label for a path, whichever tree it came from.
@@ -306,24 +360,76 @@ class Toolbox:
         if not self.allow_write:
             raise ToolError("当前模式不允许写入(单次模式需要加 --allow-write)。")
 
+    def _guard_protected(self, target: Path) -> None:
+        if not self.protect:
+            return
+        reason = _protected_reason(target)
+        if reason:
+            raise ToolError(
+                f"拒绝写入受保护的文件:{self._relative(target)}({reason})。"
+                "确实需要时,把 config.json 里 tools.protect 设为 false。"
+            )
+
+    def _remember(
+        self, path: Path, action: str, *, existed: bool, previous: str, written: str
+    ) -> None:
+        """Keep both versions; undo must not overwrite someone else's later edit."""
+        self.writes.append(WriteRecord(path, action, existed, previous, written))
+        if len(self.writes) > MAX_UNDO:
+            del self.writes[:-MAX_UNDO]
+
+    def undo_last(self) -> str | None:
+        """Undo one write after confirming, without discarding failed attempts."""
+        if not self.writes:
+            return None
+        self._guard_write()
+        record = self.writes[-1]
+        target = self._resolve(str(record.path), writable=True)
+        self._guard_protected(target)
+        if target != record.path or not target.is_file():
+            raise ToolError("文件已移动或不存在,拒绝撤销以免覆盖别人的修改。")
+        try:
+            current = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ToolError(f"撤销前无法读取原文件:{exc}") from None
+        if current != record.written:
+            raise ToolError("文件在本次写入后又被修改,拒绝撤销以免覆盖新内容。")
+        action = "撤销(删除新建的文件)" if not record.existed else "撤销"
+        if not self.confirm(action, target, current, record.previous):
+            raise ToolError("用户拒绝了这次撤销,文件未改动。")
+        try:
+            if record.existed:
+                target.write_text(record.previous, encoding="utf-8")
+            else:
+                target.unlink()
+        except OSError as exc:
+            raise ToolError(f"撤销失败:{exc.strerror or exc}") from None
+        self.writes.pop()
+        if record.existed:
+            return f"已把 {self._relative(target)} 还原到本次修改前"
+        return f"已删除本次新建的 {self._relative(target)}"
+
     def _write_file(self, path: str, content: str) -> str:
         self._guard_write()
         target = self._resolve(path, writable=True)
         if target.is_dir():
             raise ToolError(f"{self._relative(target)} 是目录。")
+        self._guard_protected(target)
 
+        existed = target.exists()
         previous = ""
-        if target.exists():
+        if existed:
             try:
                 previous = target.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                previous = ""
+            except (OSError, UnicodeDecodeError) as exc:
+                raise ToolError(f"写入前无法读取原文件:{exc}") from None
 
         if not self.confirm("写入", target, previous, content):
             raise ToolError("用户拒绝了这次写入,文件未改动。")
 
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        self._remember(target, "写入", existed=existed, previous=previous, written=content)
         return f"已写入 {self._relative(target)}({len(content)} 字符)。"
 
     def _edit_file(
@@ -337,6 +443,7 @@ class Toolbox:
         target = self._resolve(path, writable=True)
         if not target.exists():
             raise ToolError(f"文件不存在:{self._relative(target)}")
+        self._guard_protected(target)
 
         try:
             original = target.read_text(encoding="utf-8")
@@ -363,6 +470,7 @@ class Toolbox:
             raise ToolError("用户拒绝了这次编辑,文件未改动。")
 
         target.write_text(updated, encoding="utf-8")
+        self._remember(target, label, existed=True, previous=original, written=updated)
         return f"已编辑 {self._relative(target)}(替换 {occurrences if replace_all else 1} 处)。"
 
 

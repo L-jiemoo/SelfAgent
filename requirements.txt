@@ -4,3 +4,4 @@ httpx==0.28.1
 pydantic==2.14.1
 cryptography==50.0.2
 rich==15.0.0
+prompt_toolkit==3.0.48

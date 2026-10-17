@@ -9,6 +9,8 @@ keys live in the encrypted store (see secrets.py).
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,10 +20,18 @@ from .errors import ConfigError
 
 VALID_KINDS = ("openai", "anthropic")
 
+DEFAULT_THEME_TOP = (0x22, 0xD3, 0xEE)     # cyan
+DEFAULT_THEME_BOTTOM = (0xA8, 0x55, 0xF7)  # violet
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "default_provider": "deepseek",
     "default_model": "deepseek-v4-flash",
+    "agent": {
+        "name": "SelfAgent",
+        "persona": "",
+        "instructions": "",
+    },
     "providers": {
         "deepseek": {
             "kind": "openai",
@@ -84,6 +94,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "generation": {
         "max_tokens": 8192,
         "temperature": None,
+        "retries": 2,
         "system": "You are a helpful assistant.",
     },
     "ui": {
@@ -92,13 +103,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_thinking": False,
         "splash_animation": True,
         "spinner": True,
+        "prompt_box": True,
+        "theme": {
+            "top": "#22d3ee",
+            "bottom": "#a855f7",
+            "accent": "#22d3ee",
+        },
     },
     "history": {"enabled": True, "dir": "history", "max_turns": 50},
     "skills": {"enabled": True, "dir": "skills"},
+    "context": {"enabled": True, "file": "AGENTS.md", "max_chars": 8000},
     "tools": {
         "enabled": True,
         "workspace": None,
         "confirm_writes": True,
+        "protect": True,
         "max_steps": 10,
         "max_read_bytes": 262144,
     },
@@ -122,7 +141,36 @@ class ProviderSpec:
 class Generation:
     max_tokens: int = 8192
     temperature: float | None = None
+    # How many times to reopen a request that failed before producing anything.
+    # 1 means no retrying.
+    retries: int = 2
     system: str | None = None
+
+
+@dataclass
+class AgentConfig:
+    """Who the agent says it is, and how it should behave.
+
+    The default identity deliberately produces no prompt block: an unconfigured
+    install must send exactly the same request it always did.
+    """
+
+    name: str = "SelfAgent"
+    persona: str = ""
+    instructions: str = ""
+
+    def system_block(self) -> str:
+        persona = self.persona.strip()
+        instructions = self.instructions.strip()
+        if self.name == "SelfAgent" and not persona and not instructions:
+            return ""
+        lines = ["", "", "Agent identity:", f"- Your name is {self.name}."]
+        if persona:
+            lines.append(f"- Role: {persona}")
+        if instructions:
+            lines.append("- Additional instructions:")
+            lines.append(instructions)
+        return "\n".join(lines)
 
 
 @dataclass
@@ -136,6 +184,12 @@ class UIConfig:
     splash_animation: bool = True
     # The "still working" marker shown while waiting for the first token.
     spinner: bool = True
+    # The gradient box drawn around the input line in the REPL.
+    prompt_box: bool = True
+    # Decorative colours. accent defaults to top when not set in config.json.
+    theme_top: tuple[int, int, int] = DEFAULT_THEME_TOP
+    theme_bottom: tuple[int, int, int] = DEFAULT_THEME_BOTTOM
+    theme_accent: tuple[int, int, int] = DEFAULT_THEME_TOP
 
 
 @dataclass
@@ -154,11 +208,22 @@ class SkillsConfig:
 
 
 @dataclass
+class ContextConfig:
+    enabled: bool = True
+    # Read from the tool workspace, so a project's conventions live with the
+    # project instead of on the stick.
+    file: str = "AGENTS.md"
+    max_chars: int = 8000
+
+
+@dataclass
 class ToolsConfig:
     enabled: bool = True
     # None means "the directory the user launched from" -- see tools.auto_root.
     workspace: str | None = None
     confirm_writes: bool = True
+    # Refuse to rewrite credential-shaped paths (.env, *.pem, .git/, ...).
+    protect: bool = True
     # Caps the tool-call loop. Without it a model that keeps re-calling the same
     # tool spins forever.
     max_steps: int = 10
@@ -173,10 +238,12 @@ class Config:
     aliases: dict[str, tuple[str, str]]
     default_provider: str
     default_model: str
+    agent: AgentConfig
     generation: Generation
     ui: UIConfig
     history: HistoryConfig
     skills: SkillsConfig
+    context: ContextConfig
     tools: ToolsConfig
 
     def provider(self, name: str) -> ProviderSpec:
@@ -189,10 +256,28 @@ class Config:
             ) from None
 
     def save(self) -> None:
-        self.path.write_text(
-            json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        """Write the config back, atomically.
+
+        This file lives on a USB stick that can be pulled out mid-write, so the
+        new content goes to a sibling temporary file first and is swapped in
+        with os.replace. A half-written config.json would make the program
+        unlaunchable on the next machine.
+        """
+        temp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            temp.write_text(
+                json.dumps(self.raw, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp, self.path)
+        except OSError as exc:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            raise ConfigError(
+                f"无法写入 config.json:{exc.strerror or exc}"
+            ) from None
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -201,6 +286,37 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 def _as_int(value: Any, default: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+_COLOR_RE = re.compile(r"^[0-9a-fA-F]{6}$")
+
+
+def _parse_color(
+    value: Any, field: str, default: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    """#RRGGBB, RRGGBB or #RGB -> (r, g, b).
+
+    A typo is reported rather than silently ignored: the user edited this by
+    hand, and "my theme did nothing" is harder to debug than an error naming the
+    field.
+    """
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} 必须是 #RRGGBB 形式的颜色。")
+    text = value.strip()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3:
+        text = "".join(char * 2 for char in text)
+    if not _COLOR_RE.match(text):
+        raise ConfigError(f"{field} 必须是 #RRGGBB 形式的颜色(收到 {value!r})。")
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+
+
+def parse_color(value: str, field: str = "颜色") -> tuple[int, int, int]:
+    """Parse a colour typed into /theme; invalid input raises ConfigError."""
+    return _parse_color(value, field, (0, 0, 0))
 
 
 def _parse_providers(raw: Any) -> dict[str, ProviderSpec]:
@@ -289,21 +405,51 @@ def load_config() -> Config:
             )
         default_model = spec.models[0]
 
+    agent_raw = raw.get("agent") or {}
+    if not isinstance(agent_raw, dict):
+        raise ConfigError("config.json 的 agent 必须是一个对象。")
+    name = agent_raw.get("name")
+    name = name.strip() if isinstance(name, str) else ""
+    agent = AgentConfig(
+        name=name or "SelfAgent",
+        persona=agent_raw.get("persona") if isinstance(agent_raw.get("persona"), str) else "",
+        instructions=agent_raw.get("instructions")
+        if isinstance(agent_raw.get("instructions"), str)
+        else "",
+    )
+
     gen_raw = raw.get("generation") or {}
     temperature = gen_raw.get("temperature")
     gen = Generation(
         max_tokens=_as_int(gen_raw.get("max_tokens"), 8192),
         temperature=float(temperature) if isinstance(temperature, (int, float)) else None,
+        retries=max(1, _as_int(gen_raw.get("retries"), 2)),
         system=gen_raw.get("system") if isinstance(gen_raw.get("system"), str) else None,
     )
 
     ui_raw = raw.get("ui") or {}
+    theme_raw = ui_raw.get("theme")
+    if theme_raw is None:
+        theme_raw = {}
+    if not isinstance(theme_raw, dict):
+        raise ConfigError("ui.theme 必须是一个对象,包含 top / bottom / accent。")
+    theme_top = _parse_color(theme_raw.get("top"), "ui.theme.top", DEFAULT_THEME_TOP)
+    theme_bottom = _parse_color(
+        theme_raw.get("bottom"), "ui.theme.bottom", DEFAULT_THEME_BOTTOM
+    )
+    theme_accent = _parse_color(
+        theme_raw.get("accent"), "ui.theme.accent", theme_top
+    )
     ui = UIConfig(
         stream=_as_bool(ui_raw.get("stream"), True),
         color=_as_bool(ui_raw.get("color"), True),
         show_thinking=_as_bool(ui_raw.get("show_thinking"), False),
         splash_animation=_as_bool(ui_raw.get("splash_animation"), True),
         spinner=_as_bool(ui_raw.get("spinner"), True),
+        prompt_box=_as_bool(ui_raw.get("prompt_box"), True),
+        theme_top=theme_top,
+        theme_bottom=theme_bottom,
+        theme_accent=theme_accent,
     )
 
     hist_raw = raw.get("history") or {}
@@ -319,12 +465,20 @@ def load_config() -> Config:
         dir=skills_raw.get("dir") if isinstance(skills_raw.get("dir"), str) else "skills",
     )
 
+    context_raw = raw.get("context") or {}
+    context_config = ContextConfig(
+        enabled=_as_bool(context_raw.get("enabled"), True),
+        file=context_raw.get("file") if isinstance(context_raw.get("file"), str) else "AGENTS.md",
+        max_chars=max(0, _as_int(context_raw.get("max_chars"), 8000)),
+    )
+
     tools_raw = raw.get("tools") or {}
     workspace = tools_raw.get("workspace")
     tools = ToolsConfig(
         enabled=_as_bool(tools_raw.get("enabled"), True),
         workspace=workspace if isinstance(workspace, str) and workspace.strip() else None,
         confirm_writes=_as_bool(tools_raw.get("confirm_writes"), True),
+        protect=_as_bool(tools_raw.get("protect"), True),
         max_steps=max(1, _as_int(tools_raw.get("max_steps"), 10)),
         max_read_bytes=max(1024, _as_int(tools_raw.get("max_read_bytes"), 262144)),
     )
@@ -336,9 +490,11 @@ def load_config() -> Config:
         aliases=aliases,
         default_provider=default_provider,
         default_model=default_model,
+        agent=agent,
         generation=gen,
         ui=ui,
         history=history,
         skills=skills,
+        context=context_config,
         tools=tools,
     )

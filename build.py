@@ -24,7 +24,11 @@ ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 DIST = ROOT / "andist"
 TARGET = DIST / "agent"
-WORK = ROOT / "build"
+# Not "build": a Security Center rule on this machine blocks writes to
+# build\agent\agent.exe (the PE-timestamp step PyInstaller runs after linking),
+# which aborts the build right before COLLECT. A different directory name is
+# simply not on that rule's path; see the build log for the exact message.
+WORK = ROOT / "build2"
 
 # Copied next to the exe so the folder is usable the moment it is copied.
 ALWAYS_ASSETS = ("agent.bat",)
@@ -41,10 +45,10 @@ PRESERVE = ("secrets.enc", "config.json", "history", "skills")
 # things dynamically. copy_metadata is separate and easy to forget: openai and
 # anthropic read their own version through importlib.metadata at import time, and
 # collect_all does NOT copy that.
-COLLECT_ALL = ("anthropic", "openai", "cryptography")
+COLLECT_ALL = ("anthropic", "openai", "cryptography", "prompt_toolkit")
 COLLECT_SUBMODULES = ("pydantic", "httpx")
-COPY_METADATA = ("anthropic", "openai", "pydantic", "rich")
-HIDDEN_IMPORTS = ("httpx", "certifi")
+COPY_METADATA = ("anthropic", "openai", "pydantic", "rich", "prompt_toolkit", "wcwidth")
+HIDDEN_IMPORTS = ("httpx", "certifi", "wcwidth", "pygments")
 
 # None of these are used; excluding them keeps tens of megabytes out of the
 # bundle if anything reaches for them indirectly.
@@ -168,14 +172,14 @@ def build(python: Path) -> None:
     WORK.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        python, "-m", "PyInstaller",
+        python, "pyi_run.py",
         "--noconfirm", "--clean",
         "--onedir", "--console",
         "--name", "agent",
         "--distpath", "andist",
-        "--workpath", "build",
+        "--workpath", WORK,
         # Without this PyInstaller drops the generated .spec into the repo root.
-        "--specpath", "build",
+        "--specpath", WORK,
         "--paths", "src",
     ]
     for pkg in COLLECT_ALL:

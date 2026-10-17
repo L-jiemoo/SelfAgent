@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from selfagent.errors import SelfAgentError
 from selfagent.providers.base import ToolCall
-from selfagent.tools import Toolbox
+from selfagent.tools import MAX_UNDO, Toolbox
 
 
 @pytest.fixture
@@ -45,13 +46,21 @@ class Confirm:
         return self.approve
 
 
-def make(workspace: Path, *, allow_write: bool = True, approve: bool = True, read_roots=()):
+def make(
+    workspace: Path,
+    *,
+    allow_write: bool = True,
+    approve: bool = True,
+    read_roots=(),
+    protect: bool = True,
+):
     confirm = Confirm(approve)
     box = Toolbox(
         root=workspace,
         confirm=confirm,
         allow_write=allow_write,
         read_roots=tuple(read_roots),
+        protect=protect,
     )
     return box, confirm
 
@@ -370,3 +379,165 @@ def test_specs_cover_every_dispatched_handler(workspace: Path) -> None:
     box, _ = make(workspace)
     declared = {spec.name for spec in box.specs()}
     assert declared == {"read_file", "list_dir", "search", "write_file", "edit_file"}
+
+
+# ---- taking a write back ---------------------------------------------
+
+
+def test_a_write_is_remembered_with_what_it_replaced(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="hello.txt", content="changed\n")
+
+    assert len(box.writes) == 1
+    record = box.writes[0]
+    assert record.path == workspace / "hello.txt"
+    assert record.existed is True
+    assert record.previous == "line one\nline two\nline three\n"
+
+
+def test_undo_puts_the_previous_content_back(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="hello.txt", content="changed\n")
+
+    result = box.undo_last()
+
+    assert result is not None and "还原" in result
+    assert (workspace / "hello.txt").read_text(encoding="utf-8") == (
+        "line one\nline two\nline three\n"
+    )
+    assert box.writes == []
+
+
+def test_undo_of_a_created_file_removes_it(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="made/up.txt", content="fresh")
+
+    result = box.undo_last()
+
+    assert result is not None and "删除" in result
+    assert not (workspace / "made" / "up.txt").exists()
+
+
+def test_undo_of_an_edit_restores_the_original(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "edit_file", path="hello.txt", old_string="line two", new_string="LINE 2")
+
+    box.undo_last()
+
+    assert (workspace / "hello.txt").read_text(encoding="utf-8").startswith("line one\nline two\n")
+
+
+def test_undo_walks_back_one_write_at_a_time(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="a.txt", content="1")
+    run(box, "write_file", path="b.txt", content="2")
+
+    box.undo_last()
+    assert not (workspace / "b.txt").exists()
+    assert (workspace / "a.txt").exists()
+
+    box.undo_last()
+    assert not (workspace / "a.txt").exists()
+
+
+def test_undo_with_nothing_recorded_is_none(workspace: Path) -> None:
+    box, _ = make(workspace)
+    assert box.undo_last() is None
+
+
+def test_a_refused_undo_leaves_the_file_alone(workspace: Path) -> None:
+    box, confirm = make(workspace)
+    run(box, "write_file", path="hello.txt", content="changed\n")
+    confirm.approve = False
+
+    with pytest.raises(SelfAgentError, match="拒绝"):
+        box.undo_last()
+
+    assert (workspace / "hello.txt").read_text(encoding="utf-8") == "changed\n"
+    assert len(box.writes) == 1, "refusing confirmation must not lose the undo record"
+
+
+def test_undo_does_not_overwrite_a_later_external_edit(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="hello.txt", content="agent text")
+    (workspace / "hello.txt").write_text("someone else's edit", encoding="utf-8")
+    with pytest.raises(SelfAgentError, match="又被修改"):
+        box.undo_last()
+    assert (workspace / "hello.txt").read_text(encoding="utf-8") == "someone else's edit"
+    assert len(box.writes) == 1
+
+
+def test_undo_fails_safely_if_workspace_changes(workspace: Path, tmp_path: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="hello.txt", content="agent text")
+    other = tmp_path / "other"
+    other.mkdir()
+    box.root = other
+    with pytest.raises(SelfAgentError, match="越界"):
+        box.undo_last()
+    assert len(box.writes) == 1
+
+
+def test_undo_is_refused_in_read_only_mode(workspace: Path) -> None:
+    box, _ = make(workspace)
+    run(box, "write_file", path="hello.txt", content="changed\n")
+    box.allow_write = False
+
+    with pytest.raises(SelfAgentError, match="不允许写入"):
+        box.undo_last()
+
+
+def test_the_undo_stack_is_bounded(workspace: Path) -> None:
+    box, _ = make(workspace)
+    for index in range(MAX_UNDO + 5):
+        run(box, "write_file", path=f"f{index}.txt", content=str(index))
+    assert len(box.writes) == MAX_UNDO
+
+
+# ---- protected paths -------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [".env", "secrets.enc", "id_rsa", "server.pem", "app.key"])
+def test_credential_shaped_files_cannot_be_written(workspace: Path, name: str) -> None:
+    box, confirm = make(workspace)
+
+    result = run(box, "write_file", path=name, content="x")
+
+    assert result.is_error
+    assert "受保护" in result.content
+    assert confirm.calls == [], "refused before the approval prompt"
+    assert not (workspace / name).exists()
+
+
+def test_a_protected_directory_cannot_be_written(workspace: Path) -> None:
+    box, _ = make(workspace)
+    result = run(box, "write_file", path=".git/config", content="x")
+    assert result.is_error
+    assert "受保护" in result.content
+
+
+def test_editing_a_protected_file_is_refused(workspace: Path) -> None:
+    (workspace / ".env").write_text("KEY=1\n", encoding="utf-8")
+    box, _ = make(workspace)
+
+    result = run(box, "edit_file", path=".env", old_string="KEY=1", new_string="KEY=2")
+
+    assert result.is_error
+    assert "受保护" in result.content
+
+
+def test_reading_a_protected_file_is_still_allowed(workspace: Path) -> None:
+    # Protection is about writing; looking is how the model learns what is there.
+    (workspace / ".env").write_text("KEY=1\n", encoding="utf-8")
+    box, _ = make(workspace)
+    assert not run(box, "read_file", path=".env").is_error
+
+
+def test_protection_can_be_turned_off(workspace: Path) -> None:
+    box, _ = make(workspace, protect=False)
+    assert not run(box, "write_file", path=".env", content="KEY=2\n").is_error
+
+
+def test_a_lookalike_name_is_not_protected(workspace: Path) -> None:
+    box, _ = make(workspace)
+    assert not run(box, "write_file", path=".env.example", content="KEY=").is_error

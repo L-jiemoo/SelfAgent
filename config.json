@@ -2,6 +2,11 @@
   "version": 1,
   "default_provider": "deepseek",
   "default_model": "deepseek-v4-flash",
+  "agent": {
+    "name": "SelfAgent",
+    "persona": "",
+    "instructions": ""
+  },
   "providers": {
     "deepseek": {
       "kind": "openai",
@@ -60,6 +65,7 @@
   "generation": {
     "max_tokens": 8192,
     "temperature": null,
+    "retries": 2,
     "system": "You are a helpful assistant."
   },
   "ui": {
@@ -67,7 +73,13 @@
     "color": true,
     "show_thinking": false,
     "splash_animation": true,
-    "spinner": true
+    "spinner": true,
+    "prompt_box": true,
+    "theme": {
+      "top": "#22d3ee",
+      "bottom": "#a855f7",
+      "accent": "#22d3ee"
+    }
   },
   "history": {
     "enabled": true,
@@ -78,10 +90,16 @@
     "enabled": true,
     "dir": "skills"
   },
+  "context": {
+    "enabled": true,
+    "file": "AGENTS.md",
+    "max_chars": 8000
+  },
   "tools": {
     "enabled": true,
     "workspace": null,
     "confirm_writes": true,
+    "protect": true,
     "max_steps": 10,
     "max_read_bytes": 262144
   }

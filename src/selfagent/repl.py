@@ -7,9 +7,11 @@ can fail on a stranger's locked-down machine; for a chat loop it buys nothing.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__, banner, doctor, history, paths, registry
+from .config import parse_color
 from .engine import Engine
 from .errors import SelfAgentError
 from .render import Renderer, read_secret, summarize_usage
@@ -21,7 +23,9 @@ HELP = """命令(按用途分组):
   /compact           把当前对话压缩成摘要以省 token(会调用一次模型)
   /resume [序号]     列出历史会话,或载入某个继续对话(历史存在程序目录下)
   /forget [序号|区间|all] 删除历史会话记录(先列清单,再问一次才删)
+  /export [路径]     把当前对话导出成 Markdown
   /model [名称]      查看或切换模型,例:/model claude、/model deepseek/deepseek-v4-pro
+  /retry             重发上一条问题(网络抖了的时候用)
   /usage  /cost      查看本次会话的 token 用量与对话轮数
 
 环境
@@ -31,8 +35,17 @@ HELP = """命令(按用途分组):
   /skills            查看已安装的技能
 
 文件工具
-  /tools [on|off]    开关文件读写工具
+  /tools [on|off|readonly] 开关文件读写工具,或切成只读
   /dir [路径]        查看或切换工具的工作目录
+  /undo              撤回上一次文件修改(会先给你看差异再问)
+  /audit             本次会话改过哪些文件
+
+自定义(写入 config.json,下次插到别的电脑也还在)
+  /name <名字>       改界面显示名,立即生效
+  /theme <上> <下> [强调色]  改渐变配色,例:/theme #22d3ee #a855f7
+  /persona <文字>    一句话角色定位,下次启动生效(用 - 清空)
+  /instructions <文字> 附加要求,下次启动生效(用 - 清空)
+  /default-model <服务商/模型>  设为默认模型并保存
 
 密钥
   /key <服务商>      录入或更新 API Key
@@ -52,6 +65,10 @@ HELP = """命令(按用途分组):
   单次模式默认只读,要允许写入请加 --allow-write;用 --no-tools 可完全关闭,
   用 --dir 路径 可指定别的工作目录。
 
+  写错了可以用 /undo 撤回(撤销本身也要你确认)。/audit 能一屏看清这次会话动过
+  哪些文件——在别人的电脑上用完,这一条尤其有用。凭据类文件(.env、*.pem、
+  .git/ 等)默认拒写,可以在 config.json 里用 tools.protect 关掉。
+
 技能:
   程序目录下的 skills\\ 里,每个技能是一个文件夹、内含 SKILL.md。模型只会读到
   技能的名字和描述,觉得切题时才用 read_file 打开全文。技能是只读的,而且不能
@@ -62,10 +79,11 @@ def _status_text(engine: Engine) -> str:
     toolbox = engine.toolbox
     if toolbox is None:
         tools = "未启用(去掉 --no-tools 重启可开启)"
+    elif not engine.tools_enabled:
+        tools = "本次会话已关闭"
     else:
         mode = "可读可写,写入前确认" if toolbox.allow_write else "只读"
-        state = "开启" if engine.tools_enabled else "本次会话已关闭"
-        tools = f"{state}  {toolbox.root}  ({mode})"
+        tools = f"{toolbox.root}  ({mode})"
 
     usage = engine.session.usage
     history = engine.session.history_path
@@ -74,6 +92,8 @@ def _status_text(engine: Engine) -> str:
             f"当前模型    {engine.target.label}",
             f"文件工具    {tools}",
             f"已装技能    {len(engine.skills)} 个",
+            f"项目上下文  {engine.context_path or '(未找到 ' + engine.config.context.file + ')'}",
+            f"本次改动    {len(engine.audit())} 个文件(/audit 查看)",
             f"对话轮数    {engine.session.turns}",
             f"token      输入 {usage.input_tokens} / 输出 {usage.output_tokens}",
             f"历史文件    {history if history else '(未启用)'}",
@@ -300,8 +320,121 @@ def _forget(engine: Engine, renderer: Renderer, argument: str) -> None:
     renderer.status(f"已删除 {deleted} 个会话,释放 {_human_size(reclaimed)}。")
 
 
+def _to_markdown(engine: Engine) -> str:
+    lines = [
+        f"# {engine.config.agent.name} 对话导出",
+        "",
+        f"- 模型:{engine.target.label}",
+        f"- 导出时间:{datetime.now().isoformat(timespec='seconds')}",
+        f"- 对话轮数:{engine.session.turns}",
+        "",
+    ]
+    for message in engine.session.messages:
+        if message.tool_results:
+            for result in message.tool_results:
+                lines.append(f"**工具结果**{' —— 失败' if result.is_error else ''}")
+                lines.append("")
+                lines.append("```")
+                lines.append(result.content)
+                lines.append("```")
+                lines.append("")
+        elif message.tool_calls:
+            names = ", ".join(f"`{call.name}`" for call in message.tool_calls)
+            lines.append(f"**模型请求调用工具**:{names}")
+            lines.append("")
+            if message.content:
+                lines.append(message.content)
+                lines.append("")
+        else:
+            lines.append("## 你" if message.role == "user" else "## 模型")
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _export(engine: Engine, renderer: Renderer, argument: str) -> None:
+    """Write the current conversation out as Markdown.
+
+    Straight to the filesystem rather than through the tools: the user asked for
+    this by name, so it is authorised by the command itself, and the workspace
+    sandbox has nothing to say about where a transcript should land.
+    """
+    if not engine.session.messages:
+        renderer.warning("当前没有对话内容可导出。")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if argument:
+        target = Path(argument).expanduser()
+        if target.is_dir():
+            target = target / f"conversation-{stamp}.md"
+    else:
+        target = Path.cwd() / f"conversation-{stamp}.md"
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_to_markdown(engine), encoding="utf-8")
+    except OSError as exc:
+        renderer.error(f"导出失败:{exc.strerror or exc}")
+        return
+    renderer.status(f"已导出 {len(engine.session.messages)} 条消息到 {target}")
+
+
 def _prompt_for_secret(label: str) -> str:
     return read_secret(label)
+
+
+def _raw_section(config, name: str) -> dict:
+    """The mutable raw section for a config key, created when missing."""
+    section = config.raw.get(name)
+    if not isinstance(section, dict):
+        section = {}
+        config.raw[name] = section
+    return section
+
+
+def _color_text(rgb: tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
+def _theme_command(engine: Engine, renderer: Renderer, argument: str) -> None:
+    config = engine.config
+    if not argument:
+        renderer.status(
+            "当前配色: top %s  bottom %s  accent %s\n"
+            "用法:/theme <上色> <下色> [强调色],例如 /theme #22d3ee #a855f7"
+            % (
+                _color_text(config.ui.theme_top),
+                _color_text(config.ui.theme_bottom),
+                _color_text(config.ui.theme_accent),
+            )
+        )
+        return
+
+    parts = argument.split()
+    if len(parts) not in (2, 3):
+        renderer.warning("用法:/theme <上色> <下色> [强调色],颜色可写 #RRGGBB 或 #RGB。")
+        return
+
+    top = parse_color(parts[0], "theme.top")
+    bottom = parse_color(parts[1], "theme.bottom")
+    accent = parse_color(parts[2], "theme.accent") if len(parts) == 3 else top
+
+    theme = _raw_section(config, "ui").get("theme")
+    if not isinstance(theme, dict):
+        theme = {}
+        _raw_section(config, "ui")["theme"] = theme
+    theme["top"] = _color_text(top)
+    theme["bottom"] = _color_text(bottom)
+    theme["accent"] = _color_text(accent)
+    config.save()
+
+    config.ui.theme_top = top
+    config.ui.theme_bottom = bottom
+    config.ui.theme_accent = accent
+    renderer.set_theme(top, bottom, accent)
+    renderer.status("配色已保存并立即生效。")
 
 
 def _handle_command(engine: Engine, renderer: Renderer, line: str) -> bool:
@@ -323,6 +456,50 @@ def _handle_command(engine: Engine, renderer: Renderer, line: str) -> bool:
             target = engine.switch(argument)
             renderer.status(f"已切换到 {target.label}")
 
+    elif command in ("default-model", "default_model"):
+        if not argument:
+            renderer.status(
+                f"默认模型: {engine.config.default_provider}/{engine.config.default_model}\n"
+                "用法:/default-model <服务商/模型>,例如 /default-model deepseek/deepseek-v4-pro"
+            )
+        else:
+            target = engine.switch(argument)
+            engine.config.default_provider = target.provider.name
+            engine.config.default_model = target.model
+            engine.config.raw["default_provider"] = target.provider.name
+            engine.config.raw["default_model"] = target.model
+            engine.config.save()
+            renderer.status(f"默认模型已保存为 {target.label}(本次会话也已切换)。")
+
+    elif command == "theme":
+        _theme_command(engine, renderer, argument)
+
+    elif command == "name":
+        if not argument:
+            renderer.status(f"当前名字: {engine.config.agent.name}")
+        else:
+            _raw_section(engine.config, "agent")["name"] = argument
+            engine.config.save()
+            engine.config.agent.name = argument
+            renderer.set_agent_name(argument)
+            renderer.status(
+                f"界面名称已改为 {argument};系统提示里的身份下次启动生效。"
+            )
+
+    elif command in ("persona", "instructions"):
+        current = getattr(engine.config.agent, command)
+        if not argument:
+            renderer.status(f"当前 {command}: {current or '(未设置)'}")
+        else:
+            value = "" if argument == "-" else argument
+            _raw_section(engine.config, "agent")[command] = value
+            engine.config.save()
+            setattr(engine.config.agent, command, value)
+            if value:
+                renderer.status(f"{command} 已保存,下次启动生效。")
+            else:
+                renderer.status(f"{command} 已清空,下次启动生效。")
+
     elif command == "clear":
         engine.session.clear()
         renderer.status("上下文已清空。")
@@ -337,6 +514,28 @@ def _handle_command(engine: Engine, renderer: Renderer, line: str) -> bool:
 
     elif command == "forget":
         _forget(engine, renderer, argument)
+
+    elif command == "undo":
+        if engine.toolbox is None:
+            renderer.warning("本次启动没有文件工具,没有可撤销的修改。")
+        else:
+            renderer.status(engine.undo() or "本次会话没有可撤销的修改了。")
+
+    elif command == "audit":
+        records = engine.audit()
+        if not records:
+            renderer.status("本次会话还没有修改过任何文件。")
+        else:
+            lines = [f"本次会话修改过 {len(records)} 个文件(最新在前):"]
+            for index, record in enumerate(records, 1):
+                kind = record.action if record.existed else "新建"
+                lines.append(f"  {index:>2}  {kind:<12} {engine.toolbox.label(record.path)}")
+            lines.append("")
+            lines.append("用 /undo 可以逐个撤回(会先给你看差异再问)。")
+            renderer.status("\n".join(lines))
+
+    elif command == "export":
+        _export(engine, renderer, argument)
 
     elif command == "key":
         provider_name, _, value = argument.partition(" ")
@@ -378,6 +577,10 @@ def _handle_command(engine: Engine, renderer: Renderer, line: str) -> bool:
                 lines.append(f"  {skill.name:<16} {skill.description}")
             renderer.status("\n".join(lines))
 
+    elif command == "retry":
+        renderer.status("重发上一条问题…")
+        engine.retry()
+
     elif command in ("usage", "cost"):
         usage = summarize_usage(engine.session.usage) or "本次会话暂无用量数据"
         renderer.status(f"{usage}\n对话轮数 {engine.session.turns}")
@@ -403,16 +606,17 @@ def _handle_command(engine: Engine, renderer: Renderer, line: str) -> bool:
 
     elif command == "tools":
         wanted = argument.lower()
-        if wanted in ("on", "off"):
-            engine.set_tools(wanted == "on")
-            renderer.status(f"文件工具已{'开启' if engine.tools_enabled else '关闭'}。")
+        if wanted in ("on", "off", "readonly"):
+            renderer.status(engine.set_tools_mode(wanted))
         elif wanted:
-            renderer.warning("用法:/tools on 或 /tools off")
+            renderer.warning("用法:/tools on、/tools off 或 /tools readonly")
         elif engine.toolbox is None:
             renderer.status("文件工具:未启用(本次启动用了 --no-tools,或工作目录不存在)。")
+        elif not engine.tools_enabled:
+            renderer.status("文件工具:已关闭。用法:/tools on、/tools readonly、/tools off")
         else:
-            state = "开启" if engine.tools_enabled else "关闭"
-            renderer.status(f"文件工具:{state}。用法:/tools on 或 /tools off")
+            state = "可读可写" if engine.toolbox.allow_write else "只读"
+            renderer.status(f"文件工具:{state}。用法:/tools on、/tools readonly、/tools off")
 
     elif command == "dir":
         if engine.toolbox is None:
@@ -455,14 +659,13 @@ def run(engine: Engine, renderer: Renderer) -> int:
             directory_label=label,
             tools_note=note,
             skills=[skill.name for skill in engine.skills] or None,
+            name=engine.config.agent.name,
         ),
-        top=banner.COLOR_TOP,
-        bottom=banner.COLOR_BOTTOM,
     )
 
     while True:
         try:
-            line = input("\n你> ").strip()
+            line = renderer.prompt().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

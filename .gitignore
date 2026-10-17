@@ -1,5 +1,6 @@
 andist/
 build/
+build2/
 .venv/
 __pycache__/
 *.pyc

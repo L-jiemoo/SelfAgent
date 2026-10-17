@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Literal
 
 from ..config import ProviderSpec
+from .retry import RETRY_ATTEMPTS, OnRetry
 
 Role = Literal["user", "assistant"]
 
@@ -102,6 +103,8 @@ class Provider(ABC):
         temperature: float | None = None,
         show_thinking: bool = False,
         tools: list[ToolSpec] | None = None,
+        retries: int = RETRY_ATTEMPTS,
+        on_retry: OnRetry | None = None,
     ) -> None:
         self.spec = spec
         self.model = model
@@ -111,6 +114,10 @@ class Provider(ABC):
         self.temperature = temperature
         self.show_thinking = show_thinking
         self.tools = tools or []
+        # Only ever used to reopen a request that failed before producing
+        # anything; see providers/retry.py.
+        self.retries = retries
+        self.on_retry = on_retry
 
     @abstractmethod
     def stream(self, messages: list[Message]) -> Iterator[StreamEvent]:

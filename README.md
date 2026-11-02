@@ -20,6 +20,13 @@ SelfAgent — 便携式多模型命令行助手
    按提示输入服务商名(如 deepseek、anthropic、qwen、kimi、zhipu、doubao、
    openai、custom)和对应的 API Key。直接回车结束录入。
 
+   页面展示:(启动可能会等待几秒,这要看U盘读写速度)
+
+   ![启动页面](docs/images/startup.png)
+
+   命令提示
+
+   ![命令提示](docs/images/command-hints.png)
 
 二、日常使用
 ------------------------------------------------
